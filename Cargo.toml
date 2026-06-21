@@ -1,0 +1,18 @@
+[package]
+name = "shakeupwrap-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust front-end for ShakeUpWrap: parallel encrypt/decrypt linking XKCP for the crypto"
+
+[[bin]]
+name = "shakeupwrap-rs"
+path = "src/main.rs"
+
+[dependencies]
+crossbeam-channel = "0.5"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3

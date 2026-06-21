@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: sudo apt-get update && sudo apt-get install -y xsltproc bats
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (also builds libXKCP from the submodule)
+        run: cargo build --release
+
+      - name: Conformance tests
+        run: SUW_BIN="$(pwd)/target/release/shakeupwrap-rs" bats tests
