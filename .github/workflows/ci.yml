@@ -5,8 +5,22 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
+  build-test:
+    name: build & test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            xkcp_target: x86-64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            xkcp_target: generic64
+    env:
+      # Honoured by build.rs and the interop cref Makefile.
+      XKCP_TARGET: ${{ matrix.xkcp_target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,3 +36,6 @@ jobs:
 
       - name: Conformance tests
         run: SUW_BIN="$(pwd)/target/release/shakeupwrap-rs" bats tests
+
+      - name: Cross-implementation interop (Rust <-> C reference)
+        run: ./tests/interop/run_interop.sh

@@ -41,7 +41,10 @@ fn main() {
     }
 
     if !lib.exists() || !header_dir.exists() {
-        panic!("expected {:?} and {:?} after building XKCP", lib, header_dir);
+        panic!(
+            "expected {:?} and {:?} after building XKCP",
+            lib, header_dir
+        );
     }
 
     // Compile the C shim against the freshly built XKCP headers.

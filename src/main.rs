@@ -130,7 +130,11 @@ fn reader_loop(
         }
         // Empty plaintext: one empty final chunk.
         cur.clear();
-        let _ = work_tx.send(Job { index: 0, is_final: true, data: cur });
+        let _ = work_tx.send(Job {
+            index: 0,
+            is_final: true,
+            data: cur,
+        });
         return;
     }
     cur.truncate(cur_len);
@@ -161,7 +165,14 @@ fn reader_loop(
         }
 
         let data = std::mem::take(&mut cur);
-        if work_tx.send(Job { index, is_final, data }).is_err() {
+        if work_tx
+            .send(Job {
+                index,
+                is_final,
+                data,
+            })
+            .is_err()
+        {
             return; // writer gone
         }
         index += 1;
@@ -182,7 +193,11 @@ fn worker_loop(
     is_decrypt: bool,
 ) {
     for job in work_rx.iter() {
-        let final_flag = if job.is_final { FINAL_TRUE } else { FINAL_FALSE };
+        let final_flag = if job.is_final {
+            FINAL_TRUE
+        } else {
+            FINAL_FALSE
+        };
         let aad = make_aad(salt, job.index, final_flag);
         let mut inst = base.clone();
 
@@ -200,7 +215,11 @@ fn worker_loop(
         };
 
         if res_tx
-            .send(Res { index: job.index, is_final: job.is_final, out })
+            .send(Res {
+                index: job.index,
+                is_final: job.is_final,
+                out,
+            })
             .is_err()
         {
             return; // writer gone
@@ -254,7 +273,9 @@ fn run_pipeline(
     salt: &[u8; SALT_SIZE],
     is_decrypt: bool,
 ) -> Result<(), String> {
-    let nthreads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let nthreads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let cap = nthreads.max(2);
     let read_cap = if is_decrypt { ENC_CHUNK } else { CHUNK };
 
@@ -335,11 +356,14 @@ impl Output {
     fn commit(self) -> Result<(), String> {
         match self {
             Output::Stdout(mut w) => w.flush().map_err(|e| format!("output flush failed: {e}")),
-            Output::File { mut w, tmp, final_path } => {
+            Output::File {
+                mut w,
+                tmp,
+                final_path,
+            } => {
                 w.flush().map_err(|e| format!("output flush failed: {e}"))?;
                 drop(w);
-                std::fs::rename(&tmp, &final_path)
-                    .map_err(|e| format!("output rename failed: {e}"))
+                std::fs::rename(&tmp, &final_path).map_err(|e| format!("output rename failed: {e}"))
             }
         }
     }
@@ -371,7 +395,8 @@ fn create_key(path: &str) -> Result<[u8; KEY_SIZE], String> {
                 format!("cannot create key file: {e}")
             }
         })?;
-    f.write_all(&key).map_err(|e| format!("key write failed: {e}"))?;
+    f.write_all(&key)
+        .map_err(|e| format!("key write failed: {e}"))?;
     Ok(key)
 }
 
@@ -409,7 +434,12 @@ fn usage() {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { encrypt: false, decrypt: false, key: None, output: None };
+    let mut a = Args {
+        encrypt: false,
+        decrypt: false,
+        key: None,
+        output: None,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -460,7 +490,13 @@ fn encrypt(args: &Args) -> Result<(), String> {
         return Err(format!("output write failed: {e}"));
     }
 
-    let r = run_pipeline(BufReader::new(io::stdin()), out.writer(), &base, &salt, false);
+    let r = run_pipeline(
+        BufReader::new(io::stdin()),
+        out.writer(),
+        &base,
+        &salt,
+        false,
+    );
     match r {
         Ok(()) => out.commit(),
         Err(e) => {
@@ -503,7 +539,11 @@ fn main() {
         }
     };
 
-    let res = if args.encrypt { encrypt(&args) } else { decrypt(&args) };
+    let res = if args.encrypt {
+        encrypt(&args)
+    } else {
+        decrypt(&args)
+    };
 
     if let Err(e) = res {
         eprintln!("Error: {e}");

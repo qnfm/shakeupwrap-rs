@@ -71,6 +71,30 @@ boundaries, truncation/tamper rejection, CLI behaviour):
 SUW_BIN=$(pwd)/target/release/shakeupwrap-rs bats tests
 ```
 
+### Cross-implementation interop
+
+`tests/interop/` checks that the Rust binary and an independent C reference
+implementation (`tests/interop/cref`, the `parallel_pipe_suw` variant, pinned)
+produce mutually decryptable ciphertext in both directions across empty,
+single-chunk and multi-chunk inputs:
+
+```sh
+cargo build --release
+./tests/interop/run_interop.sh
+```
+
+### CI
+
+`.github/workflows/ci.yml` builds, runs the conformance suite, and runs the
+interop test on **both `x86_64` and `arm64`** (the latter on a native
+`ubuntu-24.04-arm` runner with `XKCP_TARGET=generic64`). Running the interop
+test on both architectures also confirms the on-disk format is byte-portable
+across endianness/word-size assumptions.
+
+`.github/workflows/update-xkcp.yml` runs daily, bumps the pinned XKCP submodule
+to upstream `master`, and opens a pull request when there is a change (so the
+update only lands after CI — including interop on both arches — passes).
+
 ## Layout
 
 ```
@@ -79,5 +103,6 @@ c_shim/suw_ffi.c    # struct-agnostic C ABI over SHAKE_Wrap_*
 src/xkcp.rs         # safe Rust wrapper over the shim
 src/main.rs         # CLI + streaming parallel pipeline
 tests/*.bats        # conformance tests
+tests/interop/      # cross-implementation interop (Rust <-> C reference)
 third_party/xkcp    # XKCP, pinned git submodule (the crypto)
 ```

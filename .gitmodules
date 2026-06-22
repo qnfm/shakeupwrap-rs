@@ -1,3 +1,5 @@
 [submodule "third_party/xkcp"]
 	path = third_party/xkcp
 	url = https://github.com/XKCP/XKCP.git
+	branch = master
+	shallow = true

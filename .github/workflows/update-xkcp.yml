@@ -1,0 +1,55 @@
+name: Update XKCP submodule
+
+on:
+  schedule:
+    # Daily at 06:00 UTC.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-xkcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Bump XKCP submodule to upstream latest
+        id: bump
+        run: |
+          before="$(git -C third_party/xkcp rev-parse HEAD)"
+          # Track the submodule's configured branch (master) and its nested submodules.
+          git submodule update --remote --recursive third_party/xkcp
+          after="$(git -C third_party/xkcp rev-parse HEAD)"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after"   >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "XKCP already up to date ($after)."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "XKCP $before -> $after"
+          fi
+
+      - name: Create pull request
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/update-xkcp
+          title: "chore: update XKCP submodule to latest upstream"
+          commit-message: "chore: bump XKCP submodule ${{ steps.bump.outputs.before }} -> ${{ steps.bump.outputs.after }}"
+          body: |
+            Automated daily bump of the pinned XKCP submodule to upstream `master`.
+
+            * before: `${{ steps.bump.outputs.before }}`
+            * after:  `${{ steps.bump.outputs.after }}`
+
+            CI (build + conformance + cross-implementation interop on x86_64 and
+            arm64) must pass before merging.
+          add-paths: |
+            third_party/xkcp
+          delete-branch: true
