@@ -1,0 +1,158 @@
+(*
+ * ProVerif 2.05 model of the ShakingUpAE (SHAKE_Wrap) chunked file format
+ * used by shakeupwrap-rs (and the C parallel_pipe_suw reference).
+ *
+ * Format being modelled:
+ *   - 64-byte key K (symmetric, shared secret).
+ *   - Per-file 32-byte random salt S in the header.
+ *   - Plaintext split into independent 4 MiB chunks; chunk i is wrapped as
+ *     C_i = Wrap_K(AAD_i, P_i) with AAD_i = S || i || final_i,
+ *     final_i = 1 for the last chunk, 0 otherwise.
+ *   - 64-byte authentication tag per chunk.
+ *
+ * What we verify (symbolic, Dolev-Yao):
+ *   1. Confidentiality of any plaintext chunk under a honest key/salt.
+ *   2. Integrity/authenticity: the adversary cannot get the decryptor to
+ *      accept a chunk it did not produce (truncation, reordering, chunk
+ *      splicing across files, tampering, extension).
+ *   3. The AAD binding (salt, index, final) is what defeats reorder/truncate/
+ *      splice: we show that if the AAD were only the index (no salt), a
+ *      cross-file chunk splice becomes possible (the "no-salt" query fails).
+ *
+ * Abstraction choices:
+ *   - SHAKE_Wrap is modelled as a keyed authenticated "seal" constructor with
+ *     a perfect tag: an adversary can only obtain a valid (AAD, ciphertext)
+ *     pair by asking the honest encryptor. This is the standard symbolic
+ *     idealisation of an AEAD (INT-CTXT + IND-CPA in the symbolic world).
+ *   - The salt is a fresh nonce per file; the key is a long-term symmetric
+ *     key known only to the honest parties (the key file is assumed
+ *     uncompromised; the keyleak process models compromise of a DIFFERENT
+ *     key kL, since leaking the file key itself would let the attacker
+ *     forge seal() outputs, trivially breaking integrity under any design).
+ *   - Plaintexts are fresh honest values chosen by the encryptors (the
+ *     model is not a chosen-plaintext oracle; the confidentiality query is
+ *     reachability-based: the adversary must not recover an honest m).
+ *)
+
+set traceDisplay = long.
+
+type key.
+type salt.
+type index.
+type chunkdata.
+
+(* The AEAD: seal(k, aad, m) -> authenticated ciphertext.
+   Symbolically: unrecoverable without k, unforgeable without k. *)
+fun seal(key, bitstring, chunkdata): bitstring.
+reduc forall k: key, a: bitstring, m: chunkdata;
+  unseal(k, a, seal(k, a, m)) = m.
+
+(* AAD construction: salt || index || final. We model the concatenation as a
+   tuple; injectivity of the index and the distinctness of the final flag are
+   what the format relies on. *)
+fun aad_nosalt(index, bitstring): bitstring.
+
+(* final flag values are distinct constants *)
+const final_true: bitstring [data].
+const final_false: bitstring [data].
+
+(* index constructors: distinct, injective *)
+fun idx(nat): index.
+
+(* --------------------------------------------------------------- *)
+(* Events                                                           *)
+(* --------------------------------------------------------------- *)
+
+event accepts(key, salt, index, bitstring, chunkdata).
+   (* decryptor accepted chunk (index) of a file with (key, salt), plaintext m *)
+
+event sends(key, salt, index, bitstring, chunkdata).
+   (* encryptor emitted chunk (index) of a file with (key, salt), plaintext m *)
+
+event key_leaked(key).
+   (* the adversary obtained the key *)
+
+(* Correspondence: every accepted chunk was honestly sent with the same
+   (key, salt, index, final, plaintext). This is exactly "no tamper, no
+   reorder, no truncate, no splice": any accepted chunk must match an
+   honestly-produced chunk with identical AAD and content. *)
+query k: key, s: salt, i: index, f: bitstring, m: chunkdata;
+  event(accepts(k, s, i, f, m)) ==> event(sends(k, s, i, f, m)).
+
+(* Confidentiality of the plaintext: the adversary cannot obtain any
+   honestly-encrypted chunk plaintext unless it also leaked the key.
+   ProVerif form: attacker(m) implies key_leaked(k). *)
+query m: chunkdata, k: key, s: salt, i: index, f: bitstring;
+  event(sends(k, s, i, f, m)) && attacker(m) ==> event(key_leaked(k)).
+
+(* --------------------------------------------------------------- *)
+(* Processes                                                        *)
+(* --------------------------------------------------------------- *)
+
+(* One private channel per key consumer: a private channel carries one
+   message, so a single shared key channel would let only ONE of the three
+   consumers read k. *)
+free c_kd: channel [private].     (* key -> decryptor  *)
+free c_ke2: channel [private].    (* key -> encryptor2 *)
+free c_kd2: channel [private].    (* key -> decryptor2 *)
+free c_header: channel.
+free c_header2: channel.
+free c_cipher: channel.
+free c_leak: channel.
+
+let encryptor =
+  new k: key;
+  new s: salt;
+  new m0: chunkdata;
+  new m1: chunkdata;
+  out(c_kd, k);
+  out(c_ke2, k);
+  out(c_kd2, k);
+  out(c_header, s);               (* salt header written to output *)
+  (* chunk 0 *)
+  event sends(k, s, idx(0), final_false, m0);
+  out(c_cipher, seal(k, aad_nosalt(idx(0), final_false), m0));
+  (* chunk 1 = final chunk *)
+  event sends(k, s, idx(1), final_true, m1);
+  out(c_cipher, seal(k, aad_nosalt(idx(1), final_true), m1)).
+
+let decryptor =
+  in(c_kd, k: key);
+  in(c_header, s: salt);
+  (* chunk 0 *)
+  in(c_cipher, c0: bitstring);
+  let m0 = unseal(k, aad_nosalt(idx(0), final_false), c0) in
+    event accepts(k, s, idx(0), final_false, m0);
+  (* chunk 1 (final) *)
+  in(c_cipher, c1: bitstring);
+  let m1 = unseal(k, aad_nosalt(idx(1), final_true), c1) in
+    event accepts(k, s, idx(1), final_true, m1).
+
+(* A second file using the SAME key (private fan-out channel) but a fresh
+   salt. The salt is the only difference between the two files' AAD; it is
+   what the cross-file splice below turns on. *)
+let encryptor2 =
+  in(c_ke2, k: key);
+  new s2: salt;
+  out(c_header2, s2);
+  new m: chunkdata;
+  event sends(k, s2, idx(0), final_true, m);
+  out(c_cipher, seal(k, aad_nosalt(idx(0), final_true), m)).
+
+let decryptor2 =
+  in(c_kd2, k: key);
+  in(c_header2, s2: salt);
+  in(c_cipher, c: bitstring);
+  let m = unseal(k, aad_nosalt(idx(0), final_true), c) in
+    event accepts(k, s2, idx(0), final_true, m).
+
+(* The adversary may also learn a key (insider/compromise scenario).
+   c_leak is public: once leaked, the attacker holds kL. The leaked key is
+   deliberately DISTINCT from the file key (see header note). *)
+let keyleak =
+  new kL: key;
+  event key_leaked(kL);
+  out(c_leak, kL).
+
+process
+  ( encryptor | decryptor | encryptor2 | decryptor2 | keyleak )

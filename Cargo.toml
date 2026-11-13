@@ -16,3 +16,6 @@ cc = "1"
 
 [profile.release]
 opt-level = 3
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
