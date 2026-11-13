@@ -1,0 +1,84 @@
+(* CryptoVerif computational model of the shakeupwrap-rs chunk format.
+
+   Unlike the ProVerif models (perfect-crypto, Dolev-Yao), this model makes
+   NO perfect-crypto assumption. SHAKE_Wrap is only assumed to be a
+   nonce-based AEAD that is IND-CPA and INT-CTXT secure, with concrete
+   adversary advantages Penc and Pencctxt. CryptoVerif then proves the
+   file-format properties with an explicit probability bound.
+
+   How the code maps to the model (src/main.rs, worker_loop):
+     - every chunk is wrapped by a FRESH CLONE of the keyed DWrap instance,
+       so Wrap_K(AAD, P) is deterministic and the 48-byte AAD
+       salt || index || final is the only thing that varies: it plays the
+       role of the AEAD nonce. Security therefore requires that the AAD
+       never repeats under one key (event repeated_nonce below).
+     - aad(salt, index, final) is injective: proved on the real make_aad by
+       the Kani harnesses aad_injective_in_{salt,index_and_final,final_flag}.
+     - within one file the encryptor uses each chunk index once (the real
+       reader assigns indices 0,1,2,...); across files the salt is a fresh
+       32-byte random value, so a repeated AAD needs a salt collision,
+       which CryptoVerif accounts for in the bound.
+
+   Adversary powers: chooses every plaintext pair, chunk index and final
+   flag; sees every salt and ciphertext; submits arbitrary
+   (salt, index, final, ciphertext) to the decryptor, which reveals only
+   accept/reject (the plaintext of an accepted chunk is not returned,
+   giving a CCA-style game in which the attacker learns validity). *)
+
+param Nf, Nc, Nd.
+
+type key [large, fixed].
+type salt [large, fixed].
+type chunkidx [bounded].
+type cleartext.
+type ciphertext.
+type aad_t.
+type add_data [bounded].
+
+proba Penc.
+proba Pencctxt.
+
+expand AEAD_nonce(key, cleartext, ciphertext, add_data, aad_t, enc, dec, injbot, Z, Penc, Pencctxt).
+
+(* The whole AAD is the AEAD nonce; there is no separate associated data. *)
+fun aad(salt, chunkidx, bool): aad_t [data].
+const no_ad: add_data.
+
+event sent(salt, chunkidx, bool, cleartext).
+event accepted(salt, chunkidx, bool, cleartext).
+
+(* Integrity/authenticity: every chunk the decryptor accepts was produced by
+   the honest encryptor for the SAME salt (file), SAME index (position) and
+   SAME final flag, with the same plaintext. This rules out forgery and
+   tampering, cross-file splicing, reordering, and truncation (an
+   intermediate chunk can never be accepted as final). *)
+query s: salt, i: chunkidx, f: bool, m: cleartext;
+  event(accepted(s, i, f, m)) ==> event(sent(s, i, f, m)).
+
+(* Confidentiality: left-or-right indistinguishability of every chunk. *)
+query secret b [cv_bit].
+
+process
+  Ostart() :=
+    b <-R bool;
+    k <-R key;
+    return();
+    ((foreach jf <= Nf do
+        OFile() :=
+          s <-R salt;
+          return(s);
+          foreach jc <= Nc do
+            OEnc(i: chunkidx, f: bool, m0: cleartext, m1: cleartext) :=
+              (* the honest encryptor never reuses an index within a file *)
+              find u <= Nc suchthat defined(i[u], c[u]) && i[u] = i then yield else
+              if Z(m0) = Z(m1) then
+              let m: cleartext = if_fun(b, m1, m0) in
+              event sent(s, i, f, m);
+              let c: ciphertext = enc(m, no_ad, k, aad(s, i, f)) in
+              return(c))
+     |
+     (foreach jd <= Nd do
+        ODec(s': salt, i': chunkidx, f': bool, c': ciphertext) :=
+          let injbot(m') = dec(c', no_ad, k, aad(s', i', f')) in
+          event accepted(s', i', f', m');
+          return()))

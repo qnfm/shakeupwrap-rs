@@ -85,6 +85,14 @@ query k: key, s: salt, i: index, f: bitstring, m: chunkdata;
 query m: chunkdata, k: key, s: salt, i: index, f: bitstring;
   event(sends(k, s, i, f, m)) && attacker(m) ==> event(key_leaked(k)).
 
+(* Sanity (non-vacuity) queries: these MUST come out "false", i.e. the
+   honest send and accept events are reachable. If either is "true", the
+   model is blocked and the correspondence results above are vacuous. *)
+query k: key, s: salt, i: index, f: bitstring, m: chunkdata;
+  event(sends(k, s, i, f, m)).
+query k: key, s: salt, i: index, f: bitstring, m: chunkdata;
+  event(accepts(k, s, i, f, m)).
+
 (* --------------------------------------------------------------- *)
 (* Processes                                                        *)
 (* --------------------------------------------------------------- *)

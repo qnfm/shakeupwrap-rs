@@ -2,7 +2,7 @@
 
 Crate: `shakeupwrap-rs` (salted, chunked file-encryption CLI: 4 MiB chunks, 64-byte SHAKE_Wrap (ShakingUpAE) tag, 32-byte salt in the header, AAD-bound chunk index + final flag).
 
-Toolchain used: **Kani 0.68.0** (CBMC backend) for code-level verification, **ProVerif** (opam, default switch) for symbolic protocol-level verification.
+Toolchain used: **Kani 0.68.0** (CBMC backend) for code-level verification, **ProVerif** (opam, default switch) for symbolic protocol-level verification, and **CryptoVerif 2.13** for computational (no perfect-crypto) proofs with explicit probability bounds.
 
 ---
 
@@ -13,7 +13,8 @@ Two complementary layers:
 | Layer | Tool | Target | Result |
 |---|---|---|---|
 | Code-level property proofs | Kani 0.68.0 | `src/main.rs` (`make_aad`, `validate_dec`, `read_full`) | 10/10 harnesses SUCCESS |
-| Protocol-level model | ProVerif | `verification/proverif/suw.pv`, `suw_nosalt.pv` | suw.pv: both queries TRUE; nosalt control: integrity FALSE (as designed) |
+| Protocol-level model (symbolic) | ProVerif | `verification/proverif/suw.pv`, `suw_nosalt.pv` | suw.pv: both queries TRUE; nosalt control: integrity FALSE (as designed); non-vacuity checks pass |
+| Protocol-level proof (computational) | CryptoVerif 2.13 | `verification/cryptoverif/suw.ocv`, `suw_nosalt.ocv` | suw.ocv: integrity and confidentiality proved with bounds; nosalt control: unprovable (nonce reuse) |
 | Regression / interop | bats | `tests/*.bats` | 26/26 pass |
 | Release build | cargo | `cargo build --release` | clean |
 
@@ -24,6 +25,7 @@ cargo kani                       # all harnesses
 cargo build --release
 SUW_BIN=$(pwd)/target/release/shakeupwrap-rs bats tests
 cd verification/proverif && proverif suw.pv && proverif suw_nosalt.pv
+cd ../cryptoverif && cryptoverif -lib $(opam var prefix)/doc/cryptoverif/default suw.ocv
 ```
 
 ---
@@ -86,6 +88,30 @@ In `suw.pv` the identical splice fails: the chunk is sealed under `aad(s, …)` 
 - Plaintexts are fresh `new m` values chosen by the encryptors rather than attacker-supplied inputs: an earlier draft used a private plaintext channel with no producer, which silently blocked every encryptor and made all "true" results **vacuous** — always check that the honest `sends` events are reachable before trusting a correspondence query.
 - The leak process releases a **distinct** key `kL`, not the file key `k`: leaking `k` itself lets the attacker forge `seal(k, aad(s2, …), m)` from scratch, which trivially breaks integrity under any design and is out of scope for the chunk-binding property being modelled. (An earlier draft leaked `k` and made even `suw.pv` false — that "failure" was the model, not the design.)
 - Chunk-data and key/salt types are abstract (constructors `seal`/`unseal`/`aad`); ProVerif checks reachability over the symbolic Dolev–Yao attacker.
+- **Non-vacuity checks.** Both models also query `event(sends(...))` and `event(accepts(...))`. ProVerif must answer these with **false** (the event is reachable), and it does for both models. If either ever comes back true, the model is blocked and the correspondence results above are meaningless.
+
+---
+
+## 3b. CryptoVerif computational proof (no perfect-crypto assumption)
+
+ProVerif treats `seal` as perfect. `verification/cryptoverif/suw.ocv` removes that idealisation. SHAKE_Wrap is assumed only to be a **nonce-based AEAD that is IND-CPA and INT-CTXT secure** (CryptoVerif library macro `AEAD_nonce`), with adversary advantages `Penc` and `Pencctxt`. CryptoVerif then derives the file-format guarantees by a machine-checked sequence of games.
+
+**Why nonce-based.** `worker_loop` wraps every chunk with a fresh clone of the keyed `DWrap` instance, and the code has no nonce. `Wrap_K(AAD, P)` is therefore deterministic, and the 48-byte AAD `salt ‖ index ‖ final` is the only per-chunk variation, so it plays the role of the nonce. The symbolic model could not express that confidentiality depends on the AAD never repeating under one key; the computational model makes this explicit (event `repeated_nonce`).
+
+**Model.** One long-term key; `Nf` files, each with a fresh uniformly random 32-byte salt; per file up to `Nc` chunks whose index, final flag and *pair* of plaintexts `(m0, m1)` the adversary chooses (equal length; indices unique within a file, as the real reader assigns 0,1,2,…); `Nd` decryption queries on arbitrary attacker-chosen `(salt, index, final, ciphertext)`, revealing accept/reject. `aad` is injective, which is exactly what Kani harnesses 1–3 prove about the real `make_aad`.
+
+**Results (CryptoVerif 2.13, "All queries proved"):**
+
+| Property | Bound on adversary advantage |
+|---|---|
+| Integrity: `accepted(s,i,f,m) ⇒ sent(s,i,f,m)` (no forgery, tamper, cross-file splice, reorder, or truncation, since an intermediate chunk can never be accepted as final) | `Pencctxt(t, #OEnc, Nd, ℓ, ℓ') + Nf²/|salt|` |
+| Confidentiality: left-or-right bit secrecy of `b` | `2·Pencctxt(…) + 2·Penc(t, #OEnc, ℓ) + 4·Nf²/|salt|` |
+
+With `|salt| = 2²⁵⁶`, the salt term is negligible. For example, at 2³² files under one key, `4·Nf²/|salt| = 2⁻¹⁹⁴`. The guarantees reduce to SHAKE_Wrap's own IND-CPA and INT-CTXT advantage.
+
+**Computational negative control.** `suw_nosalt.ocv` is identical but drops the salt from the AAD. CryptoVerif then **cannot prove either query**, and the blocking step is `event(repeated_nonce) ==> false`: the same `(index, final)` AAD recurs across files under one key. Without the salt the bound has no valid proof, which shows the salt term is necessary.
+
+**What remains assumed.** That SHAKE_Wrap is IND-CPA and INT-CTXT as a nonce-respecting AEAD (published ShakingUpAE/duplex analyses reduce this to Keccak-f[1600] behaving as a random permutation; that is a cryptographic conjecture and cannot be proved), that the key file holds a uniformly random 64-byte key, and that chunk indices do not repeat within a file (they are a `u64` counter; 2⁶⁴ chunks of 4 MiB are not reachable).
 
 ---
 
@@ -102,7 +128,7 @@ Prose comparison only: Cobblestone was not installed, built or modelled here, so
 | Random access | none: sequential reader loop; decrypt requires streaming from the start | yes: `ReaderAt` semantics — seek to any chunk and decrypt it independently |
 | Parallelism | multi-threaded pipeline (reader → worker pool → writer with `AtomicBool` error stop) | per-chunk parallel decryption |
 | Key reuse model | one key + per-file salt; integrity of cross-file splicing rests on salt-in-AAD (proved above) | key commitment + HKDF info binding gives stronger cross-context separation |
-| Verification performed here | 10 Kani proofs + 2 ProVerif models (one negative control) | none performed here |
+| Verification performed here | 10 Kani proofs, 2 ProVerif models and 2 CryptoVerif models (each with a negative control) | none performed here |
 
 **Trade-off summary.** shakeupwrap-rs wins on throughput-oriented geometry (huge chunks ⇒ negligible per-chunk overhead and a simple parallel pipeline) and on having machine-checked evidence that its salt-in-AAD scheme defeats cross-file splicing. Cobblestone-128 wins on flexibility (true random access via 16 KiB chunks, `ReaderAt`) and on richer key material (key commitment + HKDF info gives per-file context separation beyond a bare salt). The ProVerif negative control is the sharpest demonstration of the difference: remove the salt from the AAD — i.e. move one step toward a bare-index scheme — and integrity collapses to an expressible splice attack.
 
@@ -110,10 +136,10 @@ Prose comparison only: Cobblestone was not installed, built or modelled here, so
 
 ## 5. Limitations
 
-- **Symbolic idealisation.** ProVerif works in the Dolev–Yao model with perfect-crypto `seal`/`unseal`; it proves structural binding, not bit-level crypto strength (no birthday, nonce-reuse or side-channel analysis).
+- **Crypto assumptions.** ProVerif idealises the crypto as perfect; CryptoVerif (§3b) removes that idealisation and proves the format secure *relative to* SHAKE_Wrap being an IND-CPA + INT-CTXT nonce-based AEAD. That primitive assumption ultimately rests on Keccak-f[1600] being indistinguishable from a random permutation, which is a conjecture that no tool can prove. Side channels and timing are not modelled.
 - **Bounded harness domains.** Kani harnesses exhaustively cover the AAD layout and validator logic, but large-loop chunk I/O is covered by integration tests rather than symbolic execution (4M-iteration loops exceed the 600 s budget).
-- **Model-vs-code gap.** The ProVerif `aad(salt, index, final)` constructor corresponds to `make_aad`/`validate_dec`, which Kani proves injective and canonical; the bridge between the two layers is by-construction, not mechanically checked.
-- **Vacuity risk.** Three modelling drafts produced misleading results (vacuous TRUE from a blocked encryptor, FALSE from leaking the file key) before the final models above; the reported results are from the versions in `verification/proverif/`.
+- **Model-vs-code gap.** The ProVerif/CryptoVerif `aad(salt, index, final)` constructor corresponds to `make_aad`/`validate_dec`, which Kani proves injective and canonical; the bridge between the layers is by-construction, not mechanically checked.
+- **Vacuity risk.** Earlier ProVerif drafts produced misleading results (vacuous TRUE from a blocked encryptor, FALSE from leaking the file key). Both models now include reachability (non-vacuity) queries that guard against this automatically.
 - **Scope.** No verification of the header parser, thread pipeline, or CLI surface; the key-leak query models compromise of *other* keys only (see §3 notes).
 
 ---
@@ -129,4 +155,9 @@ eval $(opam env --switch=default)
 cd verification/proverif
 proverif suw.pv          # integrity true, confidentiality true
 proverif suw_nosalt.pv   # integrity false (splice attack found), confidentiality true
+                         # non-vacuity queries: "not event(...) is false" in both
+cd ../cryptoverif        # opam install cryptoverif
+CVLIB=$(opam var prefix)/doc/cryptoverif/default
+cryptoverif -lib $CVLIB suw.ocv          # All queries proved (bounds in §3b)
+cryptoverif -lib $CVLIB suw_nosalt.ocv   # Could not prove (repeated_nonce)
 ```
