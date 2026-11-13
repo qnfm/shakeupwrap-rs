@@ -15,16 +15,63 @@
 
 mod xkcp;
 
+#[cfg(not(shuttle))]
 use crossbeam_channel::{bounded, Receiver, Sender};
+#[cfg(shuttle)]
+use shim::{bounded, Receiver, Sender};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+#[cfg(not(shuttle))]
+use std::sync::{atomic::AtomicBool, Mutex};
+#[cfg(not(shuttle))]
 use std::thread;
+#[cfg(shuttle)]
+use shuttle::sync::{atomic::AtomicBool, Mutex};
+#[cfg(shuttle)]
+use shuttle::thread;
+
+/// Under `--cfg shuttle` the pipeline runs on Shuttle's controlled scheduler.
+/// This shim gives a bounded MPMC channel with crossbeam's API surface, built
+/// from Shuttle's `sync_channel` so every send/recv is a scheduling point.
+#[cfg(shuttle)]
+mod shim {
+    use shuttle::sync::{mpsc, Mutex};
+    use std::sync::Arc;
+
+    pub struct Sender<T>(mpsc::SyncSender<T>);
+    impl<T> Clone for Sender<T> {
+        fn clone(&self) -> Self {
+            Sender(self.0.clone())
+        }
+    }
+    impl<T> Sender<T> {
+        pub fn send(&self, v: T) -> Result<(), ()> {
+            self.0.send(v).map_err(|_| ())
+        }
+    }
+
+    pub struct Receiver<T>(Arc<Mutex<mpsc::Receiver<T>>>);
+    impl<T> Clone for Receiver<T> {
+        fn clone(&self) -> Self {
+            Receiver(self.0.clone())
+        }
+    }
+    impl<T> Receiver<T> {
+        pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+            std::iter::from_fn(move || self.0.lock().unwrap().recv().ok())
+        }
+    }
+
+    pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
+        let (tx, rx) = mpsc::sync_channel(cap);
+        (Sender(tx), Receiver(Arc::new(Mutex::new(rx))))
+    }
+}
 
 use xkcp::DWrap;
 
@@ -65,6 +112,26 @@ pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> 
     Ok(total)
 }
 
+/// Key-file parser: a key file is exactly KEY_SIZE raw bytes.
+pub(crate) fn parse_key(data: &[u8]) -> Result<[u8; KEY_SIZE], String> {
+    if data.len() != KEY_SIZE {
+        return Err("Invalid key file size".into());
+    }
+    let mut key = [0u8; KEY_SIZE];
+    key.copy_from_slice(data);
+    Ok(key)
+}
+
+/// Ciphertext header parser: consumes exactly SALT_SIZE bytes.
+pub(crate) fn read_salt(input: &mut impl Read) -> Result<[u8; SALT_SIZE], String> {
+    let mut salt = [0u8; SALT_SIZE];
+    let n = read_full(input, &mut salt).map_err(|e| format!("input read failed: {e}"))?;
+    if n != SALT_SIZE {
+        return Err("Invalid ciphertext".into());
+    }
+    Ok(salt)
+}
+
 #[cfg(kani)]
 pub(crate) fn read_full_slice(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
@@ -102,14 +169,26 @@ fn set_err(slot: &Mutex<Option<String>>, msg: String) {
     }
 }
 
+#[cfg_attr(not(kani), allow(dead_code))]
 pub(crate) fn validate_dec(cur_len: usize, is_final: bool, index: u64) -> Result<(), String> {
+    validate_dec_n(cur_len, is_final, index, ENC_CHUNK)
+}
+
+/// `validate_dec` for an arbitrary encrypted-chunk size (production uses
+/// ENC_CHUNK; the Shuttle tests use tiny chunks).
+pub(crate) fn validate_dec_n(
+    cur_len: usize,
+    is_final: bool,
+    index: u64,
+    enc_chunk: usize,
+) -> Result<(), String> {
     if cur_len < TAGLEN {
         return Err("Invalid ciphertext".into());
     }
-    if !is_final && cur_len != ENC_CHUNK {
+    if !is_final && cur_len != enc_chunk {
         return Err("Invalid ciphertext".into());
     }
-    if is_final && cur_len > ENC_CHUNK {
+    if is_final && cur_len > enc_chunk {
         return Err("Invalid ciphertext".into());
     }
     if is_final && cur_len == TAGLEN && index != 0 {
@@ -130,7 +209,8 @@ mod kani_harnesses {
     // Minimal concrete reader so Kani can model read_full's argument
     // concretely (impl Read/Slice deref chains blow up the solver).
 
-    use crate::{make_aad, read_full, read_full_slice, validate_dec};
+    use crate::{make_aad, parse_key, read_full, read_full_slice, read_salt, validate_dec};
+    use crate::KEY_SIZE;
     use crate::{AAD_SIZE, ENC_CHUNK, FINAL_FALSE, FINAL_TRUE, SALT_SIZE, TAGLEN, CHUNK};
 
     #[kani::proof]
@@ -249,6 +329,46 @@ mod kani_harnesses {
         assert_eq!(a[SALT_SIZE + 8], f);
         assert!(a[SALT_SIZE + 9..].iter().all(|&b| b == 0));
     }
+
+    // ---- Header parser -------------------------------------------------
+
+    #[kani::proof]
+    #[kani::unwind(70)]
+    fn key_parser_exact_size_only() {
+        // Every length 0..=KEY_SIZE+1 (symbolic contents): accepted iff
+        // exactly KEY_SIZE bytes, and then the key is the bytes verbatim.
+        let buf: [u8; KEY_SIZE + 1] = kani::any();
+        for len in 0..=KEY_SIZE + 1 {
+            match parse_key(&buf[..len]) {
+                Ok(k) => {
+                    assert_eq!(len, KEY_SIZE);
+                    assert!(k == buf[..KEY_SIZE]);
+                }
+                Err(_) => assert_ne!(len, KEY_SIZE),
+            }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(36)]
+    fn salt_header_parser() {
+        // Every input length 0..=SALT_SIZE+1 with symbolic contents: the
+        // parser accepts iff >= SALT_SIZE bytes are present, returns exactly
+        // the first SALT_SIZE bytes, and leaves the stream positioned at the
+        // first chunk (consumes exactly SALT_SIZE bytes).
+        let src: [u8; SALT_SIZE + 1] = kani::any();
+        for n in 0..=SALT_SIZE + 1 {
+            let mut rest = &src[..n];
+            match read_salt(&mut rest) {
+                Ok(salt) => {
+                    assert!(n >= SALT_SIZE);
+                    assert!(salt == src[..SALT_SIZE]);
+                    assert_eq!(rest.len(), n - SALT_SIZE);
+                }
+                Err(_) => assert!(n < SALT_SIZE),
+            }
+        }
+    }
 }
 
 fn reader_loop(
@@ -304,7 +424,8 @@ fn reader_loop(
         let is_final = next_len == 0;
 
         if is_decrypt {
-            if let Err(msg) = validate_dec(cur.len(), is_final, index) {
+            // read_cap == ENC_CHUNK in production decrypt mode.
+            if let Err(msg) = validate_dec_n(cur.len(), is_final, index, read_cap) {
                 set_err(err, msg);
                 stop.store(true, Ordering::Release);
                 return;
@@ -377,7 +498,7 @@ fn worker_loop(
 /// Reassemble results in sequence order and write them. Returns on completion
 /// or first error; keeps draining the channel so workers never block.
 fn writer_loop(
-    res_rx: Receiver<Res>,
+    res_rx: impl IntoIterator<Item = Res>,
     out: &mut dyn Write,
     stop: &AtomicBool,
     err: &Mutex<Option<String>>,
@@ -386,7 +507,7 @@ fn writer_loop(
     let mut buf: HashMap<u64, (bool, Result<Vec<u8>, ()>)> = HashMap::new();
     let mut draining = false;
 
-    for item in res_rx.iter() {
+    for item in res_rx {
         buf.insert(item.index, (item.is_final, item.out));
         while let Some((is_final, out_chunk)) = buf.remove(&next) {
             if !draining {
@@ -420,11 +541,25 @@ fn run_pipeline(
     salt: &[u8; SALT_SIZE],
     is_decrypt: bool,
 ) -> Result<(), String> {
-    let nthreads = thread::available_parallelism()
+    let nthreads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let cap = nthreads.max(2);
     let read_cap = if is_decrypt { ENC_CHUNK } else { CHUNK };
+    run_pipeline_with(input, out, base, salt, is_decrypt, nthreads, cap, read_cap)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_with(
+    input: impl Read + Send,
+    out: &mut dyn Write,
+    base: &DWrap,
+    salt: &[u8; SALT_SIZE],
+    is_decrypt: bool,
+    nthreads: usize,
+    cap: usize,
+    read_cap: usize,
+) -> Result<(), String> {
 
     let (work_tx, work_rx) = bounded::<Job>(cap);
     let (res_tx, res_rx) = bounded::<Res>(cap);
@@ -446,7 +581,7 @@ fn run_pipeline(
         drop(res_tx);
 
         // Writer runs on this thread.
-        writer_loop(res_rx, out, &stop, &err);
+        writer_loop(res_rx.iter(), out, &stop, &err);
     });
 
     match err.into_inner().unwrap() {
@@ -555,12 +690,7 @@ fn read_key(path: &str) -> Result<[u8; KEY_SIZE], String> {
             format!("cannot read key file: {e}")
         }
     })?;
-    if data.len() != KEY_SIZE {
-        return Err("Invalid key file size".into());
-    }
-    let mut key = [0u8; KEY_SIZE];
-    key.copy_from_slice(&data);
-    Ok(key)
+    parse_key(&data)
 }
 
 // ---------------------------------------------------------------------------
@@ -659,11 +789,7 @@ fn decrypt(args: &Args) -> Result<(), String> {
     let base = DWrap::new(&key, TAGLEN as u32, RHO, CAPACITY);
 
     let mut input = BufReader::new(io::stdin());
-    let mut salt = [0u8; SALT_SIZE];
-    let n = read_full(&mut input, &mut salt).map_err(|e| format!("input read failed: {e}"))?;
-    if n != SALT_SIZE {
-        return Err("Invalid ciphertext".into());
-    }
+    let salt = read_salt(&mut input)?;
 
     let mut out = Output::create(&args.output)?;
     let r = run_pipeline(input, out.writer(), &base, &salt, true);
@@ -695,5 +821,296 @@ fn main() {
     if let Err(e) = res {
         eprintln!("Error: {e}");
         exit(1);
+    }
+}
+
+// Bounded-exhaustive tests of the real writer_loop (plain `cargo test`).
+// The writer's control flow depends only on (index, is_final, Ok/Err) and
+// on write success, so enumerating every arrival order (all N! permutations)
+// x every auth-failure set x every delivered subset x every write-failure
+// point, for N = 1..=5, covers every behaviour of the reorder logic for
+// files of up to 5 chunks. (Kani/CBMC runs out of memory on the heap-heavy
+// writer, so enumeration is used instead; see VERIFICATION.md.)
+#[cfg(all(test, not(shuttle)))]
+mod writer_exhaustive {
+    use super::*;
+
+    fn perms(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![vec![]];
+        }
+        let mut out = Vec::new();
+        for p in perms(n - 1) {
+            for pos in 0..=p.len() {
+                let mut q = p.clone();
+                q.insert(pos, n - 1);
+                out.push(q);
+            }
+        }
+        out
+    }
+
+    fn res(i: usize, n: usize, ok: bool) -> Res {
+        Res {
+            index: i as u64,
+            is_final: i == n - 1,
+            out: if ok { Ok(vec![i as u8 + 1, 0xAA]) } else { Err(()) },
+        }
+    }
+
+    fn expected(upto: usize) -> Vec<u8> {
+        (0..upto).flat_map(|i| [i as u8 + 1, 0xAA]).collect()
+    }
+
+    struct FailAt(usize, Vec<u8>);
+    impl Write for FailAt {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::other("disk full"));
+            }
+            self.0 -= 1;
+            self.1.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run(items: Vec<Res>, w: &mut dyn Write) -> (Option<String>, bool) {
+        let (stop, err) = (AtomicBool::new(false), Mutex::new(None));
+        writer_loop(items, w, &stop, &err);
+        (err.into_inner().unwrap(), stop.load(Ordering::Acquire))
+    }
+
+    #[test]
+    fn orders_and_stops_at_first_auth_failure() {
+        let mut cases = 0;
+        for n in 1..=5 {
+            for p in perms(n) {
+                for mask in 0u32..(1 << n) {
+                    let fail = |i: usize| mask >> i & 1 == 1;
+                    let items = p.iter().map(|&i| res(i, n, !fail(i))).collect();
+                    let mut out = Vec::new();
+                    let (e, stop) = run(items, &mut out);
+                    let first = (0..n).find(|&i| fail(i)).unwrap_or(n);
+                    assert_eq!(out, expected(first), "n={n} p={p:?} mask={mask:b}");
+                    assert_eq!(e.as_deref(), (first < n).then_some("Authentication failed"));
+                    assert!(stop);
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 2 + 4 * 2 + 8 * 6 + 16 * 24 + 32 * 120);
+    }
+
+    #[test]
+    fn never_writes_past_a_gap() {
+        for n in 1..=5 {
+            for p in perms(n) {
+                for mask in 0u32..(1 << n) {
+                    let present = |i: usize| mask >> i & 1 == 1;
+                    let items = p.iter().filter(|&&i| present(i)).map(|&i| res(i, n, true)).collect();
+                    let mut out = Vec::new();
+                    let (e, stop) = run(items, &mut out);
+                    let gap = (0..n).find(|&i| !present(i)).unwrap_or(n);
+                    assert_eq!(out, expected(gap));
+                    assert!(e.is_none());
+                    // completion is signalled only once the final chunk is written
+                    assert_eq!(stop, gap == n);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stops_at_first_write_failure() {
+        for n in 1..=5 {
+            for p in perms(n) {
+                for k in 0..=n {
+                    let items = p.iter().map(|&i| res(i, n, true)).collect();
+                    let mut w = FailAt(k, Vec::new());
+                    let (e, stop) = run(items, &mut w);
+                    assert_eq!(w.1, expected(k.min(n)));
+                    assert_eq!(e.is_some(), k < n);
+                    assert!(e.map_or(true, |m| m.starts_with("output write failed")));
+                    assert!(stop);
+                }
+            }
+        }
+    }
+}
+
+// Shuttle schedule-exploration tests (RUSTFLAGS="--cfg shuttle" cargo test).
+// They run the real run_pipeline_with / reader_loop / worker_loop /
+// writer_loop and the real XKCP crypto, with tiny chunks, under Shuttle's
+// controlled scheduler. Shuttle reports any deadlock (all threads blocked)
+// as a failure; each test also checks the functional result on every
+// explored interleaving.
+#[cfg(all(test, shuttle))]
+mod shuttle_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    const C: usize = 8; // plaintext chunk size for the model
+    const EC: usize = C + TAGLEN;
+    const SALT: [u8; SALT_SIZE] = [0x5a; SALT_SIZE];
+
+    fn base() -> DWrap {
+        DWrap::new(&[7u8; KEY_SIZE], TAGLEN as u32, RHO, CAPACITY)
+    }
+
+    fn pt(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    /// Sequential reference encryption with the same chunking rule.
+    fn reference(p: &[u8]) -> Vec<u8> {
+        let chunks: Vec<&[u8]> = if p.is_empty() { vec![&[][..]] } else { p.chunks(C).collect() };
+        let mut out = Vec::new();
+        for (i, ch) in chunks.iter().enumerate() {
+            let fin = if i + 1 == chunks.len() { FINAL_TRUE } else { FINAL_FALSE };
+            let mut c = vec![0u8; ch.len() + TAGLEN];
+            base().wrap(&mut c, &make_aad(&SALT, i as u64, fin), ch);
+            out.extend_from_slice(&c);
+        }
+        out
+    }
+
+    fn run(input: impl Read + Send, dec: bool, nthreads: usize, cap: usize) -> (Result<(), String>, Vec<u8>) {
+        let b = base();
+        let mut out = Vec::new();
+        let r = run_pipeline_with(input, &mut out, &b, &SALT, dec, nthreads, cap, if dec { EC } else { C });
+        (r, out)
+    }
+
+    /// DFS over thread schedules, capped at SUW_DFS_LIMIT (default 20000)
+    /// schedules; if fewer were needed the search was exhaustive. Then PCT
+    /// (probabilistic concurrency testing, depth 3) for deeper bug-finding.
+    fn explore(name: &str, f: impl Fn() + Send + Sync + 'static) {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let limit: usize = std::env::var("SUW_DFS_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+        let f = Arc::new(f);
+        let n = Arc::new(AtomicUsize::new(0));
+        let (g, m) = (f.clone(), n.clone());
+        shuttle::check_dfs(
+            move || {
+                m.fetch_add(1, Ordering::Relaxed);
+                g()
+            },
+            Some(limit),
+        );
+        let n = n.load(Ordering::Relaxed);
+        let kind = if n < limit { "EXHAUSTIVE" } else { "bounded" };
+        eprintln!("[shuttle] {name}: dfs {n} schedules ({kind}) + pct 1000");
+        shuttle::check_pct(move || f(), 1000, 3);
+    }
+
+    // Configurations: (plaintext length, worker threads, channel capacity).
+    const CFGS: &[(usize, usize, usize)] = &[(0, 2, 1), (1, 2, 1), (C, 2, 1), (C + 1, 2, 1), (2 * C, 2, 1), (3 * C - 1, 2, 2)];
+
+    #[test]
+    fn encrypt_matches_sequential_reference() {
+        for &(len, t, cap) in CFGS {
+            explore(&format!("enc len={len} t={t} cap={cap}"), move || {
+                let (r, out) = run(Cursor::new(pt(len)), false, t, cap);
+                assert_eq!(r, Ok(()));
+                assert_eq!(out, reference(&pt(len)), "len={len}");
+            });
+        }
+    }
+
+    #[test]
+    fn decrypt_roundtrip() {
+        for &(len, t, cap) in CFGS {
+            explore(&format!("dec len={len} t={t} cap={cap}"), move || {
+                let (r, out) = run(Cursor::new(reference(&pt(len))), true, t, cap);
+                assert_eq!(r, Ok(()));
+                assert_eq!(out, pt(len));
+            });
+        }
+    }
+
+    #[test]
+    fn tampered_chunk_fails_and_emits_only_prior_chunks() {
+        let len = 3 * C - 1; // 3 chunks
+        for bad in 0..3 {
+            explore(&format!("tamper chunk {bad}"), move || {
+                let mut ct = reference(&pt(len));
+                ct[bad * EC + 3] ^= 1;
+                let (r, out) = run(Cursor::new(ct), true, 2, 1);
+                assert_eq!(r, Err("Authentication failed".into()));
+                // Never any byte from the bad chunk or later.
+                assert_eq!(out, pt(len)[..bad * C].to_vec());
+            });
+        }
+    }
+
+    #[test]
+    fn reorder_and_truncation_rejected() {
+        explore("reorder/truncate", || {
+            let ct = reference(&pt(3 * C - 1));
+            // swap chunks 0 and 1
+            let mut sw = ct[EC..2 * EC].to_vec();
+            sw.extend_from_slice(&ct[..EC]);
+            sw.extend_from_slice(&ct[2 * EC..]);
+            assert!(run(Cursor::new(sw), true, 2, 1).0.is_err());
+            // drop final chunk
+            assert!(run(Cursor::new(ct[..2 * EC].to_vec()), true, 2, 1).0.is_err());
+            // cut mid-chunk
+            assert_eq!(run(Cursor::new(ct[..EC + 5].to_vec()), true, 2, 1).0, Err("Invalid ciphertext".into()));
+        });
+    }
+
+    struct FailingReader(Vec<u8>, usize);
+    impl Read for FailingReader {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            if self.1 >= self.0.len() {
+                return Err(io::Error::other("boom"));
+            }
+            let n = b.len().min(self.0.len() - self.1);
+            b[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+            self.1 += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn input_error_mid_stream_terminates_with_error() {
+        for avail in [0, 3, C, 2 * C + 1] {
+            explore(&format!("read error after {avail}B"), move || {
+                let (r, out) = run(FailingReader(pt(avail), 0), false, 2, 1);
+                assert!(r.unwrap_err().starts_with("input read failed"));
+                // only whole, correctly-ordered chunks preceding the error
+                assert_eq!(out, reference(&pt(3 * C))[..out.len()].to_vec());
+            });
+        }
+    }
+
+    struct FailingWriter(usize);
+    impl Write for FailingWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::other("full"));
+            }
+            self.0 -= 1;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_error_terminates_without_deadlock() {
+        for k in 0..3 {
+            explore(&format!("write error at write {k}"), move || {
+                let b = base();
+                let mut w = FailingWriter(k);
+                let r = run_pipeline_with(Cursor::new(pt(3 * C - 1)), &mut w, &b, &SALT, false, 2, 1, C);
+                assert!(r.unwrap_err().starts_with("output write failed"));
+            });
+        }
     }
 }

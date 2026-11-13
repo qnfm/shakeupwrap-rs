@@ -18,4 +18,7 @@ cc = "1"
 opt-level = 3
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)', 'cfg(shuttle)'] }
+
+[dev-dependencies]
+shuttle = "0.9"
